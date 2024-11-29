@@ -1,55 +1,51 @@
 "use strict";
 const electron = require("electron");
 const path = require("path");
-const robotjs = require("robotjs");
-const is = {
-  dev: !electron.app.isPackaged
-};
-const platform = {
-  isWindows: process.platform === "win32",
-  isMacOS: process.platform === "darwin",
-  isLinux: process.platform === "linux"
-};
-const electronApp = {
-  setAppUserModelId(id) {
-    if (platform.isWindows)
-      electron.app.setAppUserModelId(is.dev ? process.execPath : id);
-  },
-  setAutoLaunch(auto) {
-    if (platform.isLinux)
-      return false;
-    const isOpenAtLogin = () => {
-      return electron.app.getLoginItemSettings().openAtLogin;
-    };
-    if (isOpenAtLogin() !== auto) {
-      electron.app.setLoginItemSettings({
-        openAtLogin: auto,
-        path: process.execPath
-      });
-      return isOpenAtLogin() === auto;
-    } else {
-      return true;
-    }
-  },
-  skipProxy() {
-    return electron.session.defaultSession.setProxy({ mode: "direct" });
-  }
-};
 const icon = path.join(__dirname, "../../resources/icon.png");
-let tray = null;
+let mainWindow = null;
 let jiggleInterval = null;
-const JIGGLE_AMOUNT = 1;
-let currentInterval = 60;
-let isJiggling = false;
+const JIGGLE_AMOUNT = 300;
 let lastMousePosition = { x: 0, y: 0 };
 let lastMouseMoveTime = Date.now();
-function createTray() {
-  const trayIcon = electron.nativeImage.createFromPath(icon);
-  tray = new electron.Tray(trayIcon.resize({ width: 16, height: 16 }));
-  updateTrayMenu();
+function createWindow() {
+  mainWindow = new electron.BrowserWindow({
+    width: 300,
+    height: 400,
+    show: false,
+    autoHideMenuBar: true,
+    ...process.platform === "linux" ? { icon } : {},
+    webPreferences: {
+      preload: path.join(__dirname, "../preload/index.js"),
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: true
+    }
+  });
+  mainWindow.on("ready-to-show", () => {
+    mainWindow?.show();
+  });
+  if (!electron.app.isPackaged && process.env["ELECTRON_RENDERER_URL"]) {
+    mainWindow.loadURL(process.env["ELECTRON_RENDERER_URL"]);
+  } else {
+    mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
+  }
+}
+function getMousePosition() {
+  const point = electron.screen.getCursorScreenPoint();
+  return { x: point.x, y: point.y };
+}
+function moveMouse(x, y) {
+  const { exec } = require("child_process");
+  if (process.platform === "win32") {
+    exec(`powershell -command "$cursor = [System.Windows.Forms.Cursor]::Position; $cursor.X = ${x}; $cursor.Y = ${y}; [System.Windows.Forms.Cursor]::Position = $cursor"`);
+  } else if (process.platform === "darwin") {
+    exec(`osascript -e 'tell application "System Events" to set cursor position to {${x}, ${y}}'`);
+  } else {
+    exec(`xdotool mousemove ${x} ${y}`);
+  }
 }
 function checkMouseMovement() {
-  const currentPosition = robotjs.getMousePos();
+  const currentPosition = getMousePosition();
   if (currentPosition.x !== lastMousePosition.x || currentPosition.y !== lastMousePosition.y) {
     lastMousePosition = currentPosition;
     lastMouseMoveTime = Date.now();
@@ -61,7 +57,7 @@ function startJiggling(interval) {
   if (jiggleInterval) {
     clearInterval(jiggleInterval);
   }
-  lastMousePosition = robotjs.getMousePos();
+  lastMousePosition = getMousePosition();
   lastMouseMoveTime = Date.now();
   let moveRight = true;
   jiggleInterval = setInterval(
@@ -69,73 +65,44 @@ function startJiggling(interval) {
       const timeSinceLastMove = Date.now() - lastMouseMoveTime;
       if (timeSinceLastMove >= interval * 1e3) {
         if (!checkMouseMovement()) {
-          const mouse = robotjs.getMousePos();
+          const mouse = getMousePosition();
           if (moveRight) {
-            robotjs.moveMouse(mouse.x + JIGGLE_AMOUNT, mouse.y);
+            moveMouse(mouse.x + JIGGLE_AMOUNT, mouse.y);
           } else {
-            robotjs.moveMouse(mouse.x - JIGGLE_AMOUNT, mouse.y);
+            moveMouse(mouse.x - JIGGLE_AMOUNT, mouse.y);
           }
           moveRight = !moveRight;
         }
-      } else {
-        checkMouseMovement();
       }
     },
     Math.min(interval * 1e3, 5e3)
   );
-  isJiggling = true;
-  updateTrayMenu();
 }
 function stopJiggling() {
   if (jiggleInterval) {
     clearInterval(jiggleInterval);
     jiggleInterval = null;
   }
-  isJiggling = false;
-  updateTrayMenu();
-}
-function updateTrayMenu() {
-  if (!tray) return;
-  const intervalOptions = [30, 60, 120, 300].map((seconds) => ({
-    label: `${seconds} seconds`,
-    type: "radio",
-    checked: currentInterval === seconds,
-    click: () => {
-      currentInterval = seconds;
-      if (isJiggling) {
-        startJiggling(currentInterval);
-      }
-    }
-  }));
-  const contextMenu = electron.Menu.buildFromTemplate([
-    {
-      label: isJiggling ? "Stop Jiggling" : "Start Jiggling",
-      click: () => {
-        if (isJiggling) {
-          stopJiggling();
-        } else {
-          startJiggling(currentInterval);
-        }
-      }
-    },
-    { type: "separator" },
-    {
-      label: "Interval",
-      submenu: intervalOptions
-    },
-    { type: "separator" },
-    { label: "Quit", click: () => electron.app.quit() }
-  ]);
-  tray.setContextMenu(contextMenu);
-  tray.setToolTip(`Mouse Jiggler - ${isJiggling ? "Active" : "Inactive"}`);
 }
 electron.app.whenReady().then(() => {
-  if (process.platform === "darwin") {
-    electron.app.dock.hide();
-  }
-  electronApp.setAppUserModelId("com.electron");
-  createTray();
+  createWindow();
+  electron.ipcMain.on("start-jiggling", (_, interval) => {
+    console.log("Received start-jiggling with interval:", interval);
+    startJiggling(interval);
+  });
+  electron.ipcMain.on("stop-jiggling", () => {
+    console.log("Received stop-jiggling");
+    stopJiggling();
+  });
+  electron.app.on("activate", function() {
+    if (electron.BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
 });
-electron.app.on("before-quit", () => {
+electron.app.on("window-all-closed", () => {
   stopJiggling();
+  if (process.platform !== "darwin") {
+    electron.app.quit();
+  }
 });

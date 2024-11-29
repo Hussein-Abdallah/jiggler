@@ -1,25 +1,64 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
 /* eslint-disable @typescript-eslint/explicit-function-return-type */
-import { app, Tray, Menu, nativeImage } from 'electron'
-import { electronApp } from '@electron-toolkit/utils'
+import { app, BrowserWindow, ipcMain, screen } from 'electron'
+import { join } from 'path'
 import icon from '../../resources/icon.png?asset'
-import robotjs from 'robotjs'
 
-let tray: Tray | null = null
+let mainWindow: BrowserWindow | null = null
 let jiggleInterval: NodeJS.Timeout | null = null
-const JIGGLE_AMOUNT = 1
-let currentInterval = 60 // default interval in seconds
-let isJiggling = false
+const JIGGLE_AMOUNT = 300
 let lastMousePosition = { x: 0, y: 0 }
 let lastMouseMoveTime = Date.now()
 
-function createTray(): void {
-  const trayIcon = nativeImage.createFromPath(icon)
-  tray = new Tray(trayIcon.resize({ width: 16, height: 16 }))
-  updateTrayMenu()
+function createWindow(): void {
+  mainWindow = new BrowserWindow({
+    width: 300,
+    height: 400,
+    show: false,
+    autoHideMenuBar: true,
+    ...(process.platform === 'linux' ? { icon } : {}),
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: true
+    }
+  })
+
+  mainWindow.on('ready-to-show', () => {
+    mainWindow?.show()
+  })
+
+  // Load the local URL for development or the local file for production.
+  if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
+    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  } else {
+    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+  }
+}
+
+function getMousePosition() {
+  const point = screen.getCursorScreenPoint()
+  return { x: point.x, y: point.y }
+}
+
+function moveMouse(x: number, y: number) {
+  // Using the robotjs alternative approach
+  const { exec } = require('child_process')
+  if (process.platform === 'win32') {
+    // For Windows
+    exec(`powershell -command "$cursor = [System.Windows.Forms.Cursor]::Position; $cursor.X = ${x}; $cursor.Y = ${y}; [System.Windows.Forms.Cursor]::Position = $cursor"`)
+  } else if (process.platform === 'darwin') {
+    // For macOS
+    exec(`osascript -e 'tell application "System Events" to set cursor position to {${x}, ${y}}'`)
+  } else {
+    // For Linux
+    exec(`xdotool mousemove ${x} ${y}`)
+  }
 }
 
 function checkMouseMovement() {
-  const currentPosition = robotjs.getMousePos()
+  const currentPosition = getMousePosition()
   if (currentPosition.x !== lastMousePosition.x || currentPosition.y !== lastMousePosition.y) {
     lastMousePosition = currentPosition
     lastMouseMoveTime = Date.now()
@@ -34,7 +73,7 @@ function startJiggling(interval: number): void {
   }
 
   // Initialize last position
-  lastMousePosition = robotjs.getMousePos()
+  lastMousePosition = getMousePosition()
   lastMouseMoveTime = Date.now()
   let moveRight = true
 
@@ -45,23 +84,18 @@ function startJiggling(interval: number): void {
       if (timeSinceLastMove >= interval * 1000) {
         if (!checkMouseMovement()) {
           // Double check mouse hasn't moved
-          const mouse = robotjs.getMousePos()
+          const mouse = getMousePosition()
           if (moveRight) {
-            robotjs.moveMouse(mouse.x + JIGGLE_AMOUNT, mouse.y)
+            moveMouse(mouse.x + JIGGLE_AMOUNT, mouse.y)
           } else {
-            robotjs.moveMouse(mouse.x - JIGGLE_AMOUNT, mouse.y)
+            moveMouse(mouse.x - JIGGLE_AMOUNT, mouse.y)
           }
           moveRight = !moveRight
         }
-      } else {
-        checkMouseMovement() // Update last position
       }
     },
     Math.min(interval * 1000, 5000)
   ) // Check at least every 5 seconds
-
-  isJiggling = true
-  updateTrayMenu()
 }
 
 function stopJiggling(): void {
@@ -69,59 +103,37 @@ function stopJiggling(): void {
     clearInterval(jiggleInterval)
     jiggleInterval = null
   }
-  isJiggling = false
-  updateTrayMenu()
 }
 
-function updateTrayMenu(): void {
-  if (!tray) return
-
-  const intervalOptions = [30, 60, 120, 300].map((seconds) => ({
-    label: `${seconds} seconds`,
-    type: 'radio' as const,
-    checked: currentInterval === seconds,
-    click: () => {
-      currentInterval = seconds
-      if (isJiggling) {
-        startJiggling(currentInterval)
-      }
-    }
-  }))
-
-  const contextMenu = Menu.buildFromTemplate([
-    {
-      label: isJiggling ? 'Stop Jiggling' : 'Start Jiggling',
-      click: () => {
-        if (isJiggling) {
-          stopJiggling()
-        } else {
-          startJiggling(currentInterval)
-        }
-      }
-    },
-    { type: 'separator' },
-    {
-      label: 'Interval',
-      submenu: intervalOptions
-    },
-    { type: 'separator' },
-    { label: 'Quit', click: () => app.quit() }
-  ])
-
-  tray.setContextMenu(contextMenu)
-  tray.setToolTip(`Mouse Jiggler - ${isJiggling ? 'Active' : 'Inactive'}`)
-}
-
+// This method will be called when Electron has finished
+// initialization and is ready to create browser windows.
 app.whenReady().then(() => {
-  // Hide dock icon on macOS
-  if (process.platform === 'darwin') {
-    app.dock.hide()
-  }
+  // Create the browser window.
+  createWindow()
 
-  electronApp.setAppUserModelId('com.electron')
-  createTray()
+  // Set up IPC handlers
+  ipcMain.on('start-jiggling', (_, interval: number) => {
+    console.log('Received start-jiggling with interval:', interval)
+    startJiggling(interval)
+  })
+
+  ipcMain.on('stop-jiggling', () => {
+    console.log('Received stop-jiggling')
+    stopJiggling()
+  })
+
+  app.on('activate', function () {
+    // On macOS it's common to re-create a window in the app when the
+    // dock icon is clicked and there are no other windows open.
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow()
+    }
+  })
 })
 
-app.on('before-quit', () => {
+app.on('window-all-closed', () => {
   stopJiggling()
+  if (process.platform !== 'darwin') {
+    app.quit()
+  }
 })
